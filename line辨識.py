@@ -30,6 +30,7 @@ LOC_FIX = {"BZ":"B2","82":"B2","B 2":"B2","86":"B6","BG":"B6","81":"B1","83":"B3
 app = Flask(__name__)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+print(f"🔑 SECRET載入: {'OK' if LINE_CHANNEL_SECRET else 'EMPTY'} ({len(LINE_CHANNEL_SECRET)} chars)")
 
 def _parse_location(v):
     v = v.upper().replace(" ", "").strip()
