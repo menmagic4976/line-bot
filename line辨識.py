@@ -31,6 +31,7 @@ app = Flask(__name__)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 print(f"🔑 SECRET載入: {'OK' if LINE_CHANNEL_SECRET else 'EMPTY'} ({len(LINE_CHANNEL_SECRET)} chars)")
+print(f"🔍 所有LINE相關變數: { {k:v[:4]+'...' for k,v in os.environ.items() if 'LINE' in k} }")
 
 def _parse_location(v):
     v = v.upper().replace(" ", "").strip()
@@ -159,7 +160,7 @@ def webhook():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-    user_id = event.source.user_id
+    target_id = getattr(event.source, 'group_id', None) or getattr(event.source, 'room_id', None) or event.source.user_id
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         blob_api = MessagingApiBlob(api_client)
@@ -168,7 +169,7 @@ def handle_image(event):
             messages=[TextMessage(text="🔍 正在 AI 辨識中，請稍候...")]
         ))
         img_b = bytes(blob_api.get_message_content(event.message.id))
-    threading.Thread(target=process_image_task, args=(user_id, img_b), daemon=True).start()
+    threading.Thread(target=process_image_task, args=(target_id, img_b), daemon=True).start()
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
