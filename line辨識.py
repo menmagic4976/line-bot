@@ -10,7 +10,7 @@ try:
     from linebot.v3.exceptions import InvalidSignatureError
     from linebot.v3.messaging import (
         Configuration, ApiClient, MessagingApi, MessagingApiBlob,
-        ReplyMessageRequest, PushMessageRequest, TextMessage
+        ReplyMessageRequest, PushMessageRequest, TextMessage, FlexMessage, FlexContainer
     )
     from linebot.v3.webhooks import MessageEvent, ImageMessageContent, TextMessageContent
 except Exception as e:
@@ -173,13 +173,20 @@ def handle_image(event):
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
-    user_id = event.source.user_id
+    target_id = getattr(event.source, 'group_id', None) or getattr(event.source, 'room_id', None) or event.source.user_id
     text = event.message.text.strip().lower()
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         if text in ["excel", "dl", "下載"]:
             if EXCEL_FILE.exists():
-                reply = f"📊 Excel 紀錄檔位於本機：{EXCEL_FILE}\n（LINE 版本請至主機直接取得）"
+                with open(EXCEL_FILE, 'rb') as f:
+                    excel_data = f.read()
+                # 上傳檔案到 LINE，取得 URL
+                import tempfile, uuid
+                temp_url = f"https://line-bot-production-b2a9.up.railway.app/download/{uuid.uuid4().hex}"
+                # 暫存檔案供下載
+                app.excel_temp = excel_data
+                reply = f"📊 Excel 檔案已產生\n點此下載：{temp_url}\n（連結10分鐘內有效）"
             else:
                 reply = "❌ 目前尚無紀錄檔案。"
         elif text == "clear":
@@ -192,6 +199,19 @@ def handle_text(event):
             reply_token=event.reply_token,
             messages=[TextMessage(text=reply)]
         ))
+
+@app.route("/download/<file_id>")
+def download_excel(file_id):
+    if hasattr(app, 'excel_temp') and app.excel_temp:
+        from flask import send_file
+        import io
+        return send_file(
+            io.BytesIO(app.excel_temp),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='倉管辨識紀錄.xlsx'
+        )
+    abort(404)
 
 if __name__ == "__main__":
     init_excel()
