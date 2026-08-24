@@ -80,7 +80,25 @@ def append_excel_multi(results):
                 r["數量 (Quantity)"] = r["數量 (Quantity)"].lstrip(":：").strip()
             ws.append([datetime.now().strftime("%m%d-%H:%M")] + [r.get(k, MISSING) for k in KEYS])
         wb.save(EXCEL_FILE)
-    except Exception as e: print(f"Excel寫入錯誤: {e}")
+        return len([r for r in results if r.get("工單 (Part No)") != MISSING or r.get("業單 (Sales Order)") != MISSING])
+    except Exception as e:
+        print(f"Excel寫入錯誤: {e}")
+        return 0
+
+def undo_last_record():
+    """刪除最後 N 筆紀錄"""
+    init_excel()
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        last_row = ws.max_row
+        if last_row <= 1:
+            return 0
+        ws.delete_rows(last_row)
+        wb.save(EXCEL_FILE)
+        return 1
+    except Exception as e:
+        print(f"撤銷錯誤: {e}")
+        return 0
 
 def vision_get_fields(img_b, missing_fields):
     """對圖片做視覺辨識，補齊missing_fields中指定的欄位"""
@@ -232,9 +250,11 @@ def reply_text(reply_token, text):
 
 def process_image_task(reply_token, img_b):
     results = cloud_ocr_process(img_b)
-    append_excel_multi(results)
+    written_count = append_excel_multi(results)
     reply = "📋 AI 辨識結果\n"
-    reply += f"已自動寫入 {len(results)} 筆物料明細\n"
+    reply += f"已自動寫入 {written_count} 筆物料明細\n"
+    if written_count > 0:
+        reply += "💡 輸入「撤銷」可刪除剛才寫入的紀錄\n"
     reply += "────────────────\n"
     for i, res in enumerate(results, 1):
         if len(results) > 1: reply += f"📦 第 {i} 筆明細：\n"
@@ -280,6 +300,12 @@ def handle_text(event):
             if EXCEL_FILE.exists(): EXCEL_FILE.unlink()
             init_excel()
             reply = "🗑 紀錄已清空"
+        elif text in ["撤銷", "undo", "撤销"]:
+            count = undo_last_record()
+            if count > 0:
+                reply = "✅ 已刪除最後 1 筆紀錄"
+            else:
+                reply = "❌ 沒有可撤銷的紀錄"
         else:
             return
         line_bot_api.reply_message(ReplyMessageRequest(
