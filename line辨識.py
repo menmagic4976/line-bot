@@ -27,6 +27,9 @@ EXCEL_FILE = Path(__file__).parent / "records.xlsx"
 MISSING = "未找到"
 KEYS = ["工單 (Part No)", "型號 (Model)", "數量 (Quantity)", "儲位 (Location)", "業單 (Sales Order)"]
 ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 排除易混淆字元 I,O,0,1
+
+# 記錄 辨識ID → message_id 的映射（用於撤回訊息）
+record_message_map = {}
 VALID_LOC = ([f"A{i}" for i in range(1, 13)] + [f"B{i}" for i in range(1, 7)] + ["0S08", "3F", "NG", "B2", "B3"])
 LOC_FIX = {"BZ":"B2","82":"B2","B 2":"B2","86":"B6","BG":"B6","81":"B1","83":"B3","84":"B4","85":"B5","ALL":"A11","A1L":"A11","A|1":"A11","OS08":"0S08","0SO8":"0S08","OSO8":"0S08","0508":"0S08"}
 
@@ -324,9 +327,12 @@ def cloud_ocr_process(img_b):
 
 def reply_text(reply_token, text):
     with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(
+        api = MessagingApi(api_client)
+        response = api.reply_message(
             ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
         )
+        # 回傳發送的 message_id
+        return response.sent_messages[0].id if response.sent_messages else None
 
 def process_image_task(reply_token, img_b):
     results = cloud_ocr_process(img_b)
@@ -335,14 +341,21 @@ def process_image_task(reply_token, img_b):
     reply += f"已自動寫入 {written_count} 筆物料明細\n"
     if written_count > 0:
         reply += "💡 辨識ID：" + "、".join([rid.split('-')[2] for rid in record_ids]) + "\n"
-        reply += "輸入「查詢」可查看完整紀錄\n"
+        reply += "輸入「撤銷 ID」可撤回此訊息\n"
     reply += "────────────────\n"
     for i, res in enumerate(results, 1):
         if len(results) > 1: reply += f"📦 第 {i} 筆明細：\n"
         for k, v in res.items():
             reply += f" {'✅' if v != MISSING else '❌'} {k}: {v}\n"
         if len(results) > 1: reply += "──────────\n"
-    reply_text(reply_token, reply)
+
+    # 發送訊息並記錄 message_id
+    message_id = reply_text(reply_token, reply)
+    if message_id and record_ids:
+        # 將所有辨識ID都綁定到這個 message_id
+        for rid in record_ids:
+            record_message_map[rid] = message_id
+        print(f"[INFO] Recorded message_id {message_id} for IDs: {record_ids}")
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -382,10 +395,14 @@ def handle_text(event):
                     part_display = part_no if part_no and part_no != MISSING else sales if sales and sales != MISSING else "無"
                     loc_display = loc if loc and loc != MISSING else "?"
                     reply += f"[{idx}] {short_id} | {time} | {part_display} | {loc_display}\n"
-                reply += "\n💡 輸入「撤銷 A3F5」或「撤銷 1」刪除指定紀錄"
+                reply += "\n💡 輸入「撤銷 A3F5」撤回訊息"
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply)]
+            ))
 
-        # 撤銷指定 ID 或編號
-        elif text_lower.startswith("撤銷 ") or text_lower.startswith("undo ") or text_lower.startswith("刪除 "):
+        # 撤銷（撤回訊息 + 刪除 Excel）
+        elif text_lower.startswith("撤銷 ") or text_lower.startswith("undo "):
             target = text.split(None, 1)[1].strip().upper()
 
             # 檢查是否為數字（編號）
@@ -393,12 +410,25 @@ def handle_text(event):
                 records = get_recent_records(10)
                 idx = int(target)
                 if 1 <= idx <= len(records):
+                    record_id = records[idx - 1][1]
+                    short_id = record_id.split('-')[2] if '-' in str(record_id) else record_id
+
+                    # 1. 嘗試撤回訊息
+                    message_id = record_message_map.get(record_id)
+                    if message_id:
+                        try:
+                            line_bot_api.delete_message(message_id)
+                            reply = f"✅ 已撤回訊息 {short_id}"
+                        except Exception as e:
+                            reply = f"⚠️ 訊息撤回失敗（可能超過1小時）\n錯誤：{str(e)[:50]}"
+                    else:
+                        reply = f"⚠️ 找不到訊息ID（可能Bot重啟過）"
+
+                    # 2. 刪除 Excel 紀錄
                     row_idx = records[idx - 1][0]
                     success, data = delete_record_by_row(row_idx)
                     if success:
-                        reply = f"✅ 已刪除第 {idx} 筆：{data[2]} ({data[6]})"
-                    else:
-                        reply = f"❌ 刪除失敗：{data}"
+                        reply += f"\n✅ 已刪除 Excel 紀錄"
                 else:
                     reply = f"❌ 編號超出範圍（1-{len(records)}）"
 
@@ -410,25 +440,55 @@ def handle_text(event):
                     if rec[1] and str(rec[1]).endswith(target):
                         full_id = rec[1]
                         break
+
                 if full_id:
+                    # 1. 嘗試撤回訊息
+                    message_id = record_message_map.get(full_id)
+                    if message_id:
+                        try:
+                            line_bot_api.delete_message(message_id)
+                            reply = f"✅ 已撤回訊息 {target}"
+                        except Exception as e:
+                            error_msg = str(e)
+                            if "404" in error_msg or "not found" in error_msg.lower():
+                                reply = f"⚠️ 訊息已被刪除或不存在"
+                            elif "400" in error_msg:
+                                reply = f"⚠️ 訊息撤回失敗（超過1小時限制）"
+                            else:
+                                reply = f"⚠️ 訊息撤回失敗：{error_msg[:50]}"
+                    else:
+                        reply = f"⚠️ 找不到訊息ID（Bot重啟後記憶遺失）"
+
+                    # 2. 刪除 Excel 紀錄
                     success, data = delete_record_by_id(full_id)
                     if success:
-                        reply = f"✅ 已刪除 ID {target}：{data[2]} ({data[6]})"
-                    else:
-                        reply = f"❌ 刪除失敗：{data}"
+                        reply += f"\n✅ 已刪除 Excel 紀錄"
                 else:
                     reply = f"❌ 找不到 ID：{target}"
 
-            # 檢查是否為 12 碼工單號
-            elif len(target) == 12:
+            else:
+                reply = "❌ 格式錯誤\n請輸入：\n• 撤銷 1（編號）\n• 撤銷 A3F5（ID 後4碼）"
+
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply)]
+            ))
+
+        # 刪除工單（只刪 Excel，不撤回訊息）
+        elif text_lower.startswith("刪除 ") or text_lower.startswith("delete "):
+            target = text.split(None, 1)[1].strip()
+            if len(target) == 12:
                 success, data = delete_record_by_part_no(target)
                 if success:
                     reply = f"✅ 已刪除工單 {target}"
                 else:
                     reply = f"❌ {data}"
-
             else:
-                reply = "❌ 格式錯誤\n請輸入：\n• 撤銷 1（編號）\n• 撤銷 A3F5（ID）\n• 刪除 105239501A01（工單號）"
+                reply = "❌ 請輸入12碼工單號"
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply)]
+            ))
 
         # 下載 Excel
         elif text_lower in ["excel", "dl", "下載"]:
@@ -440,22 +500,23 @@ def handle_text(event):
                 reply = f"📊 當日 Excel 已產生\n點此下載：{temp_url}\n（連結10分鐘內有效）"
             else:
                 reply = "❌ 今日尚無紀錄。"
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply)]
+            ))
 
         # 清空所有紀錄
         elif text_lower == "clear":
             if EXCEL_FILE.exists(): EXCEL_FILE.unlink()
             init_excel()
             reply = "🗑 紀錄已清空"
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply)]
+            ))
 
         else:
             return
-
-        line_bot_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text=reply)]
-        ))
-
-
 @app.route("/download/<file_id>")
 def download_excel(file_id):
     if hasattr(app, 'excel_temp') and app.excel_temp:
