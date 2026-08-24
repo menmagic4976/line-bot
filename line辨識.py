@@ -1,4 +1,4 @@
-import os, sys, requests, time, json, base64, threading, re
+﻿import os, sys, requests, time, json, base64, threading, re
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, request, abort
@@ -26,6 +26,7 @@ CLAUDE_API_KEY   = os.environ.get("CLAUDE_API_KEY", "")
 EXCEL_FILE = Path(__file__).parent / "records.xlsx"
 MISSING = "未找到"
 KEYS = ["工單 (Part No)", "型號 (Model)", "數量 (Quantity)", "儲位 (Location)", "業單 (Sales Order)"]
+ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 排除易混淆字元 I,O,0,1
 VALID_LOC = ([f"A{i}" for i in range(1, 13)] + [f"B{i}" for i in range(1, 7)] + ["0S08", "3F", "NG", "B2", "B3"])
 LOC_FIX = {"BZ":"B2","82":"B2","B 2":"B2","86":"B6","BG":"B6","81":"B1","83":"B3","84":"B4","85":"B5","ALL":"A11","A1L":"A11","A|1":"A11","OS08":"0S08","0SO8":"0S08","OSO8":"0S08","0508":"0S08"}
 
@@ -42,7 +43,7 @@ def _parse_location(v):
 def init_excel():
     if EXCEL_FILE.exists(): return
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "辨識紀錄"
-    hd = ["時間"] + KEYS
+    hd = ["辨識ID", "時間"] + KEYS
     for col, h in enumerate(hd, 1):
         cell = ws.cell(1, col, h); cell.font = Font(bold=True); cell.alignment = Alignment(horizontal="center")
         ws.column_dimensions[cell.column_letter].width = 22
@@ -55,12 +56,12 @@ def get_today_excel():
         wb_all = openpyxl.load_workbook(EXCEL_FILE)
         ws_all = wb_all.active
         wb_today = openpyxl.Workbook(); ws_today = wb_today.active; ws_today.title = "當日紀錄"
-        hd = ["時間"] + KEYS
+        hd = ["辨識ID", "時間"] + KEYS
         for col, h in enumerate(hd, 1):
             cell = ws_today.cell(1, col, h); cell.font = Font(bold=True); cell.alignment = Alignment(horizontal="center")
             ws_today.column_dimensions[cell.column_letter].width = 22
         for row in ws_all.iter_rows(min_row=2, values_only=True):
-            if row[0] and str(row[0]).startswith(today):
+            if row[1] and str(row[1]).startswith(today):  # 改成檢查第2欄（時間）
                 ws_today.append(list(row))
         import io
         buf = io.BytesIO(); wb_today.save(buf); buf.seek(0)
@@ -68,25 +69,38 @@ def get_today_excel():
     except Exception as e:
         print(f"當日匯出錯誤: {e}"); return None
 
+def generate_record_id():
+    """生成唯一辨識 ID：0824-1430-A3F5"""
+    import random
+    now = datetime.now()
+    date_part = now.strftime("%m%d")
+    time_part = now.strftime("%H%M")
+    random_part = ''.join(random.choices(ID_CHARS, k=4))
+    return f"{date_part}-{time_part}-{random_part}"
+
 def append_excel_multi(results):
     init_excel()
     try:
         wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        record_ids = []
         for r in results:
             # 工單和業單都沒抓到就不寫入
             if r.get("工單 (Part No)") == MISSING and r.get("業單 (Sales Order)") == MISSING:
                 continue
             if r.get("數量 (Quantity)") and r["數量 (Quantity)"] != MISSING:
                 r["數量 (Quantity)"] = r["數量 (Quantity)"].lstrip(":：").strip()
-            ws.append([datetime.now().strftime("%m%d-%H:%M")] + [r.get(k, MISSING) for k in KEYS])
+
+            record_id = generate_record_id()
+            record_ids.append(record_id)
+            ws.append([record_id, datetime.now().strftime("%m%d-%H:%M")] + [r.get(k, MISSING) for k in KEYS])
         wb.save(EXCEL_FILE)
-        return len([r for r in results if r.get("工單 (Part No)") != MISSING or r.get("業單 (Sales Order)") != MISSING])
+        return len(record_ids), record_ids
     except Exception as e:
         print(f"Excel寫入錯誤: {e}")
-        return 0
+        return 0, []
 
 def undo_last_record():
-    """刪除最後 N 筆紀錄"""
+    """刪除最後 1 筆紀錄"""
     init_excel()
     try:
         wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
@@ -99,6 +113,72 @@ def undo_last_record():
     except Exception as e:
         print(f"撤銷錯誤: {e}")
         return 0
+
+def get_recent_records(n=10):
+    """查詢最近 N 筆紀錄，回傳 [(row_index, record_id, time, part_no, model, qty, loc, sales)]"""
+    init_excel()
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        last_row = ws.max_row
+        if last_row <= 1:
+            return []
+        records = []
+        for row_idx in range(max(2, last_row - n + 1), last_row + 1):
+            row_data = [ws.cell(row_idx, col).value for col in range(1, 8)]  # 改成8欄（含ID）
+            records.append((row_idx, *row_data))
+        return list(reversed(records))  # 最新的在最前面
+    except Exception as e:
+        print(f"查詢錯誤: {e}")
+        return []
+
+def delete_record_by_row(row_idx):
+    """刪除指定列（實際 Excel row number）"""
+    init_excel()
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        if row_idx < 2 or row_idx > ws.max_row:
+            return False, "超出範圍"
+        row_data = [ws.cell(row_idx, col).value for col in range(1, 8)]  # 改成8欄
+        ws.delete_rows(row_idx)
+        wb.save(EXCEL_FILE)
+        return True, row_data
+    except Exception as e:
+        print(f"刪除錯誤: {e}")
+        return False, str(e)
+
+def delete_record_by_id(record_id):
+    """根據辨識 ID 刪除（從最新往回找第一筆）"""
+    init_excel()
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        for row_idx in range(ws.max_row, 1, -1):
+            cell_value = ws.cell(row_idx, 1).value  # 第1欄是辨識ID
+            if cell_value and str(cell_value).strip() == record_id:
+                row_data = [ws.cell(row_idx, col).value for col in range(1, 8)]
+                ws.delete_rows(row_idx)
+                wb.save(EXCEL_FILE)
+                return True, row_data
+        return False, "找不到該 ID"
+    except Exception as e:
+        print(f"刪除錯誤: {e}")
+        return False, str(e)
+
+def delete_record_by_part_no(part_no):
+    """根據工單號碼刪除（從最新往回找第一筆）"""
+    init_excel()
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
+        for row_idx in range(ws.max_row, 1, -1):
+            cell_value = ws.cell(row_idx, 3).value  # 第3欄是工單（改成3因為前面加了ID欄）
+            if cell_value and str(cell_value).strip() == part_no:
+                row_data = [ws.cell(row_idx, col).value for col in range(1, 8)]
+                ws.delete_rows(row_idx)
+                wb.save(EXCEL_FILE)
+                return True, row_data
+        return False, "找不到該工單"
+    except Exception as e:
+        print(f"刪除錯誤: {e}")
+        return False, str(e)
 
 def vision_get_fields(img_b, missing_fields):
     """對圖片做視覺辨識，補齊missing_fields中指定的欄位"""
@@ -250,11 +330,12 @@ def reply_text(reply_token, text):
 
 def process_image_task(reply_token, img_b):
     results = cloud_ocr_process(img_b)
-    written_count = append_excel_multi(results)
+    written_count, record_ids = append_excel_multi(results)
     reply = "📋 AI 辨識結果\n"
     reply += f"已自動寫入 {written_count} 筆物料明細\n"
     if written_count > 0:
-        reply += "💡 輸入「撤銷」可刪除剛才寫入的紀錄\n"
+        reply += "💡 辨識ID：" + "、".join([rid.split('-')[2] for rid in record_ids]) + "\n"
+        reply += "輸入「查詢」可查看完整紀錄\n"
     reply += "────────────────\n"
     for i, res in enumerate(results, 1):
         if len(results) > 1: reply += f"📦 第 {i} 筆明細：\n"
@@ -284,34 +365,96 @@ def handle_image(event):
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     target_id = getattr(event.source, 'group_id', None) or getattr(event.source, 'room_id', None) or event.source.user_id
-    text = event.message.text.strip().lower()
+    text = event.message.text.strip()
+    text_lower = text.lower()
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        if text in ["excel", "dl", "下載"]:
+
+        # 查詢最近紀錄
+        if text_lower in ["查詢", "query", "list"]:
+            records = get_recent_records(10)
+            if not records:
+                reply = "❌ 目前沒有紀錄"
+            else:
+                reply = "📋 最近 10 筆紀錄：\n"
+                for idx, (row_idx, record_id, time, part_no, model, qty, loc, sales) in enumerate(records, 1):
+                    short_id = record_id.split('-')[2] if record_id and '-' in str(record_id) else "?"
+                    part_display = part_no if part_no and part_no != MISSING else sales if sales and sales != MISSING else "無"
+                    loc_display = loc if loc and loc != MISSING else "?"
+                    reply += f"[{idx}] {short_id} | {time} | {part_display} | {loc_display}\n"
+                reply += "\n💡 輸入「撤銷 A3F5」或「撤銷 1」刪除指定紀錄"
+
+        # 撤銷指定 ID 或編號
+        elif text_lower.startswith("撤銷 ") or text_lower.startswith("undo ") or text_lower.startswith("刪除 "):
+            target = text.split(None, 1)[1].strip().upper()
+
+            # 檢查是否為數字（編號）
+            if target.isdigit():
+                records = get_recent_records(10)
+                idx = int(target)
+                if 1 <= idx <= len(records):
+                    row_idx = records[idx - 1][0]
+                    success, data = delete_record_by_row(row_idx)
+                    if success:
+                        reply = f"✅ 已刪除第 {idx} 筆：{data[2]} ({data[6]})"
+                    else:
+                        reply = f"❌ 刪除失敗：{data}"
+                else:
+                    reply = f"❌ 編號超出範圍（1-{len(records)}）"
+
+            # 檢查是否為 4 碼 ID（如 A3F5）
+            elif len(target) == 4 and all(c in ID_CHARS for c in target):
+                records = get_recent_records(10)
+                full_id = None
+                for rec in records:
+                    if rec[1] and str(rec[1]).endswith(target):
+                        full_id = rec[1]
+                        break
+                if full_id:
+                    success, data = delete_record_by_id(full_id)
+                    if success:
+                        reply = f"✅ 已刪除 ID {target}：{data[2]} ({data[6]})"
+                    else:
+                        reply = f"❌ 刪除失敗：{data}"
+                else:
+                    reply = f"❌ 找不到 ID：{target}"
+
+            # 檢查是否為 12 碼工單號
+            elif len(target) == 12:
+                success, data = delete_record_by_part_no(target)
+                if success:
+                    reply = f"✅ 已刪除工單 {target}"
+                else:
+                    reply = f"❌ {data}"
+
+            else:
+                reply = "❌ 格式錯誤\n請輸入：\n• 撤銷 1（編號）\n• 撤銷 A3F5（ID）\n• 刪除 105239501A01（工單號）"
+
+        # 下載 Excel
+        elif text_lower in ["excel", "dl", "下載"]:
             today_data = get_today_excel()
             if today_data:
                 import uuid
                 temp_url = f"https://line-bot-production-b2a9.up.railway.app/download/{uuid.uuid4().hex}"
                 app.excel_temp = today_data
-                reply = f"��� 當日 Excel 已產生\n點此下載：{temp_url}\n（連結10分鐘內有效）"
+                reply = f"📊 當日 Excel 已產生\n點此下載：{temp_url}\n（連結10分鐘內有效）"
             else:
                 reply = "❌ 今日尚無紀錄。"
-        elif text == "clear":
+
+        # 清空所有紀錄
+        elif text_lower == "clear":
             if EXCEL_FILE.exists(): EXCEL_FILE.unlink()
             init_excel()
             reply = "🗑 紀錄已清空"
-        elif text in ["撤銷", "undo", "撤销"]:
-            count = undo_last_record()
-            if count > 0:
-                reply = "✅ 已刪除最後 1 筆紀錄"
-            else:
-                reply = "❌ 沒有可撤銷的紀錄"
+
         else:
             return
+
         line_bot_api.reply_message(ReplyMessageRequest(
             reply_token=event.reply_token,
             messages=[TextMessage(text=reply)]
         ))
+
 
 @app.route("/download/<file_id>")
 def download_excel(file_id):
@@ -332,3 +475,4 @@ if __name__ == "__main__":
     print("📌 請用 ngrok 或部署到 Railway 取得 HTTPS webhook URL")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
