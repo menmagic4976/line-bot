@@ -417,7 +417,9 @@ def handle_text(event):
                     message_id = record_message_map.get(record_id)
                     if message_id:
                         try:
-                            line_bot_api.delete_message(message_id)
+                            with ApiClient(configuration) as api_client:
+                                api = MessagingApi(api_client)
+                                api.delete_message(message_id)
                             reply = f"✅ 已撤回訊息 {short_id}"
                         except Exception as e:
                             reply = f"⚠️ 訊息撤回失敗（可能超過1小時）\n錯誤：{str(e)[:50]}"
@@ -446,7 +448,9 @@ def handle_text(event):
                     message_id = record_message_map.get(full_id)
                     if message_id:
                         try:
-                            line_bot_api.delete_message(message_id)
+                            with ApiClient(configuration) as api_client:
+                                api = MessagingApi(api_client)
+                                api.delete_message(message_id)
                             reply = f"✅ 已撤回訊息 {target}"
                         except Exception as e:
                             error_msg = str(e)
