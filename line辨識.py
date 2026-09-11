@@ -200,24 +200,47 @@ def vision_get_fields(img_b, missing_fields):
             + "\n".join(field_prompts)
             + "\n\n找不到的欄位不要輸出。每行只輸出一個欄位，格式如上。"
         )
-        resp = requests.post(
-            "https://shaco.chat/api/v1/messages",
-            headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1024,
-                  "messages": [{"role": "user", "content": [
-                      {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(img_b).decode()}},
-                      {"type": "text", "text": prompt}
-                  ]}]},
-            timeout=15
-        ).json()
 
-        # 檢查 API 回應結構
-        if "error" in resp:
-            print(f"Claude API 錯誤: {resp.get('error', {}).get('message', resp)}")
-            return {}
-        if "content" not in resp:
-            print(f"Claude API 回應格式異常: {resp}")
-            return {}
+        # 重試機制：最多嘗試 3 次
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    "https://shaco.chat/api/v1/messages",
+                    headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1024,
+                          "messages": [{"role": "user", "content": [
+                              {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(img_b).decode()}},
+                              {"type": "text", "text": prompt}
+                          ]}]},
+                    timeout=15
+                ).json()
+
+                # 檢查 API 回應結構
+                if "error" in resp:
+                    error_msg = resp.get('error', {}).get('message', resp)
+                    print(f"Claude API 錯誤 (嘗試 {attempt + 1}/3): {error_msg}")
+                    if attempt < 2:  # 還有重試機會
+                        time.sleep(1)  # 等待 1 秒後重試
+                        continue
+                    return {}  # 3 次都失敗，放棄
+
+                if "content" not in resp:
+                    print(f"Claude API 回應格式異常 (嘗試 {attempt + 1}/3): {resp}")
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    return {}
+
+                # 成功取得有效回應
+                break
+
+            except Exception as e:
+                print(f"Claude API 請求異常 (嘗試 {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return {}
 
         raw = next((item["text"] for item in resp["content"] if item["type"] == "text"), "")
         raw = re.sub(r'<INTERNAL_THINKING>.*?</INTERNAL_THINKING>', '', raw, flags=re.DOTALL)
