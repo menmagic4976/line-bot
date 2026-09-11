@@ -87,6 +87,7 @@ def append_excel_multi(results):
         wb = openpyxl.load_workbook(EXCEL_FILE); ws = wb.active
         record_ids = []
         for r in results:
+            print(f"[DEBUG] 寫入前檢查: 工單={r.get('工單 (Part No)')}, 業單={r.get('業單 (Sales Order)')}")
             # 工單和業單都沒抓到就不寫入
             if r.get("工單 (Part No)") == MISSING and r.get("業單 (Sales Order)") == MISSING:
                 continue
@@ -258,16 +259,25 @@ def llm_parse(raw_text):
             if r["儲位 (Location)"] != MISSING:
                 r["儲位 (Location)"] = _parse_location(r["儲位 (Location)"])
             if r["業單 (Sales Order)"] != MISSING:
-                if r["儲位 (Location)"] == MISSING:
-                    r["儲位 (Location)"] = "B2"
-                r["工單 (Part No)"] = MISSING
+                # 驗證業單格式：必須是 7 碼英數字
+                sales_order = r["業單 (Sales Order)"]
+                if len(sales_order) == 7 and sales_order.isalnum():
+                    # 格式正確，執行互斥邏輯
+                    if r["儲位 (Location)"] == MISSING:
+                        r["儲位 (Location)"] = "B2"
+                    print(f"[DEBUG] 業單邏輯觸發: 業單={sales_order}, 工單={r['工單 (Part No)']} (即將被清除)")
+                    r["工單 (Part No)"] = MISSING
+                else:
+                    # 格式錯誤，視為 DeepSeek 誤判
+                    print(f"[DEBUG] 業單格式不符（{len(sales_order)}碼）: {sales_order}，視為誤判並清除")
+                    r["業單 (Sales Order)"] = MISSING
             results.append(r)
         return results or [EMPTY]
     except Exception as e:
         print(f"LLM解析錯誤: {e}"); return [EMPTY]
 
 def preprocess_image(img_b):
-    """圖片前處理：增強對比、去噪、銳化"""
+    """圖片前處理：溫和增強對比、去噪（保留灰階，適合手寫）"""
     try:
         nparr = np.frombuffer(img_b, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -275,22 +285,15 @@ def preprocess_image(img_b):
         # 1. 轉灰階
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 2. 自適應對比增強（CLAHE）
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        # 2. 自適應對比增強（CLAHE，降低強度）
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
         enhanced = clahe.apply(gray)
 
-        # 3. 去噪
-        denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
+        # 3. 去噪（降低強度）
+        denoised = cv2.fastNlMeansDenoising(enhanced, None, 7, 7, 21)
 
-        # 4. 銳化
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(denoised, -1, kernel)
-
-        # 5. 二值化（讓文字更清晰）
-        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 轉回 JPEG bytes
-        _, buffer = cv2.imencode('.jpg', binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        # 轉回 JPEG bytes（保留灰階，不做二值化）
+        _, buffer = cv2.imencode('.jpg', denoised, [cv2.IMWRITE_JPEG_QUALITY, 95])
         return buffer.tobytes()
     except Exception as e:
         print(f"圖片前處理失敗，使用原圖: {e}")
