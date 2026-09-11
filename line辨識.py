@@ -267,11 +267,12 @@ def llm_parse(raw_text):
             "你是倉管單據解析助手。以下是OCR文字，請提取明細。\n"
             "若含多筆明細（多個業單號），每筆獨立成一個物件。\n\n"
             "欄位規則：\n"
-            "1. 工單(Part No)：剛好12碼英數，不以Q開頭，對應「工單號碼」欄位\n"
+            "1. 工單(Part No)：**必須是剛好12碼**（不多不少），英數組合，不以Q開頭。如果OCR文字中有多個候選數字，必須選擇正好12碼的那個。例如：105493501A01（12碼）是工單，1054935（7碼）不是工單。\n"
             "2. 型號(Model)：至少3字元英數組合\n"
             "3. 數量(Quantity)：數字或分數格式如120或120/2\n"
             "4. 儲位(Location)：英數組合如A9/B6/0S08/3F，多為手寫，找不到填「未找到」\n"
-            "5. 業單(Sales Order)：剛好7碼純數字、以5開頭，不符填「未找到」\n\n"
+            "5. 業單(Sales Order)：剛好7碼英數字，可能在星號*後面（如*Q1054935），提取時去掉星號。不符填「未找到」\n\n"
+            "**重要**：如果看到 105493501A01 和 Q1054935 同時出現，105493501A01（12碼）是工單，Q1054935（7碼+Q開頭）是業單。\n\n"
             "找不到的欄位一律填「未找到」。只回傳JSON：\n"
             "{\"items\":[{\"工單 (Part No)\":\"...\",\"型號 (Model)\":\"...\",\"數量 (Quantity)\":\"...\",\"儲位 (Location)\":\"...\",\"業單 (Sales Order)\":\"...\"}]}\n\n"
             f"OCR文字：\n{raw_text}"
@@ -282,7 +283,16 @@ def llm_parse(raw_text):
             json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}},
             timeout=30
         ).json()
-        items = json.loads(resp["choices"][0]["message"]["content"]).get("items", [])
+
+        # 記錄 DeepSeek 原始回應
+        print(f"[DEBUG] DeepSeek 完整回應: {json.dumps(resp, ensure_ascii=False)}")
+
+        raw_content = resp["choices"][0]["message"]["content"]
+        print(f"[DEBUG] DeepSeek 返回內容: {raw_content}")
+
+        items = json.loads(raw_content).get("items", [])
+        print(f"[DEBUG] DeepSeek 解析出 {len(items)} 筆明細")
+
         results = []
         for item in items:
             r = {k: str(item.get(k, MISSING)).strip() or MISSING for k in KEYS}
