@@ -210,6 +210,15 @@ def vision_get_fields(img_b, missing_fields):
                   ]}]},
             timeout=15
         ).json()
+
+        # 檢查 API 回應結構
+        if "error" in resp:
+            print(f"Claude API 錯誤: {resp.get('error', {}).get('message', resp)}")
+            return {}
+        if "content" not in resp:
+            print(f"Claude API 回應格式異常: {resp}")
+            return {}
+
         raw = next((item["text"] for item in resp["content"] if item["type"] == "text"), "")
         raw = re.sub(r'<INTERNAL_THINKING>.*?</INTERNAL_THINKING>', '', raw, flags=re.DOTALL)
         found = {}
